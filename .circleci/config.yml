@@ -57,6 +57,17 @@ commands:
       - run:
           name: Wait for port << parameters.port >>
           command: dockerize -wait tcp://localhost:<< parameters.port >> -timeout 60s
+  maybe_wait_for_container:
+    parameters:
+      db: {type: string}
+      port: {type: integer}
+    steps:
+      - run:
+          name: Maybe wait for container
+          command: |
+            if [[ "$DB" == *<< parameters.db >>* ]]; then
+              dockerize -wait tcp://localhost:<< parameters.port >> -timeout 60s
+            fi
   maybe_prepare_minio:
     steps:
       - run:
@@ -123,6 +134,17 @@ commands:
       - persist_to_workspace:
           root: ~/app/
           paths: ["*"]
+  maybe_prepare_pgsql:
+    parameters: { db: {type: string} }
+    steps:
+      - run:
+         name: configure pgsql
+         command: |
+           # psql -U postgres -c "CREATE ROLE ejabberd PASSWORD 'mongooseim_secret' SUPERUSER CREATEDB CREATEROLE INHERIT LOGIN;"
+           # psql -U postgres -c "CREATE DATABASE ejabberd;"
+           sudo apt-get update
+           sudo apt-get install -y postgresql-client-12
+           psql -h 127.0.0.1 -p 5432 -U ejabberd -q -d ejabberd -f priv/pg.sql
 
 references:
   - &OTP23 cimg/elixir:1.11  # Contains Erlang 23.1
@@ -131,7 +153,16 @@ references:
 
 executors:
   # With REDIS
-  otp_23_redis:
+  otp_23_pgsql:
+    working_directory: ~/app
+    docker:
+      - image: *OTP23
+      - image: circleci/postgres:12.5-ram
+        environment:
+          - POSTGRES_PASSWORD: "mongooseim_secret"
+          - POSTGRES_USER: "ejabberd"
+          - POSTGRES_DB: "ejabberd"
+  otp_23_redis_minio_rmq:
     working_directory: ~/app
     docker:
       - image: *OTP23
@@ -142,6 +173,11 @@ executors:
           - MINIO_SECRET_KEY: "CG5fGqG0/n6NCPJ10FylpdgRnuV52j8IZvU7BSj8"
         command: ["server", "/data"]
       - image: rabbitmq:3.7-alpine
+  otp_23_redis:
+    working_directory: ~/app
+    docker:
+      - image: *OTP23
+      - image: circleci/redis:6.0.5
   otp_22_redis:
     working_directory: ~/app
     docker:
@@ -261,9 +297,10 @@ jobs:
     steps:
       - restore_workspace
       - install_dockerize
-      - dockerize_wait: {port: 6379} # Wait for redis
-      - dockerize_wait: {port: 5672} # Wait for rmq
+      - maybe_wait_for_container: {db: redis, port: 6379} # wait for redis
+      - maybe_wait_for_container: {db: rmq, port: 5672} # wait for rmq
       - maybe_prepare_minio
+      - maybe_prepare_pgsql: {db: <<parameters.db>>}
       - run:
           name: Prepare /etc/hosts
           command: |
@@ -375,32 +412,32 @@ workflows:
   build_and_test:
     jobs:
       # ============= PACKAGES =============
-      - package:
-          name: centos_7
-          executor: otp_23
-          platform: centos_7
-          context: mongooseim-org
-          otp_package: 23.1-1
-      - package:
-          name: debian_stretch
-          executor: otp_23
-          platform: debian_stretch
-          context: mongooseim-org
-          otp_package: 23.1-1
+      # - package:
+      #     name: centos_7
+      #     executor: otp_23
+      #     platform: centos_7
+      #     context: mongooseim-org
+      #     otp_package: 23.1-1
+      # - package:
+      #     name: debian_stretch
+      #     executor: otp_23
+      #     platform: debian_stretch
+      #     context: mongooseim-org
+      #     otp_package: 23.1-1
       # ============= BASE BUILDS =============
       - build:
           name: otp_23
           executor: otp_23
           context: mongooseim-org
           build_prod: true
-      - build:
-          name: otp_22
-          executor: otp_22
-          context: mongooseim-org
-      - build:
-          name: otp_21
-          executor: otp_21
-          context: mongooseim-org
+      # - build:
+      #     name: otp_22
+      #     executor: otp_22
+      #     context: mongooseim-org
+      # - build:
+      #     name: otp_21
+      #     executor: otp_21
+      #     context: mongooseim-org
       # ============= SMALL TESTS =============
       - small_tests:
           name: small_tests_23
@@ -408,49 +445,58 @@ workflows:
           context: mongooseim-org
           requires:
             - otp_23
-      - small_tests:
-          name: small_tests_22
-          executor: otp_22_redis
-          context: mongooseim-org
-          requires:
-            - otp_22
-      - small_tests:
-          name: small_tests_21
-          executor: otp_21_redis
-          context: mongooseim-org
-          requires:
-            - otp_21
+      # - small_tests:
+      #     name: small_tests_22
+      #     executor: otp_22_redis
+      #     context: mongooseim-org
+      #     requires:
+      #       - otp_22
+      # - small_tests:
+      #     name: small_tests_21
+      #     executor: otp_21_redis
+      #     context: mongooseim-org
+      #     requires:
+      #       - otp_21
       # ============= MOST RECENT VERSION TESTS =============
+      # - big_tests:
+      #     name: internal_mnesia
+      #     executor: otp_23_redis_minio_rmq
+      #     context: mongooseim-org
+      #     preset: internal_mnesia
+      #     db: "mnesia redis minio rmq"
+      #     tls_dist: true
+      #     requires:
+      #       - otp_23
       - big_tests:
-          name: internal_mnesia
-          executor: otp_23_redis
+          name: pgsql_mnesia
+          executor: otp_23_pgsql
           context: mongooseim-org
           preset: internal_mnesia
-          db: "mnesia minio"
-          tls_dist: true
+          db: "pgsql"
           requires:
             - otp_23
       # ============= DIALYZER =============
-      - dialyzer:
-          name: dialyzer
-          executor: otp_23
-          context: mongooseim-org
-          requires:
-            - otp_23
+      # - dialyzer:
+      #     name: dialyzer
+      #     executor: otp_23
+      #     context: mongooseim-org
+      #     requires:
+      #       - otp_23
       # ============= DOCUMENTATION =============
-      - docs_build_deploy:
-          name: build_and_deploy_docs
-          context: mongooseim-org
-          filters: *all_tags
+      # - docs_build_deploy:
+      #     name: build_and_deploy_docs
+      #     context: mongooseim-org
+      #     filters: *all_tags
       # ============= DOCKER IMAGE BUILD & UPLOAD =============
-      - docker_image:
-          name: docker_build_and_ship
-          executor: otp_23
-          context: mongooseim-org
-          requires:
-            - small_tests_23
-            - small_tests_22
-            - small_tests_21
-            - dialyzer
-            - build_and_deploy_docs
-            - internal_mnesia
+      # - docker_image:
+      #     name: docker_build_and_ship
+      #     executor: otp_23
+      #     context: mongooseim-org
+      #     requires:
+      #       - small_tests_23
+      #       - small_tests_22
+      #       - small_tests_21
+      #       - dialyzer
+      #       - build_and_deploy_docs
+      #       - internal_mnesia
+      #       - pgsql_mnesia
